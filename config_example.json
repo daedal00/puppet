@@ -1,0 +1,6 @@
+{
+  "mode": "local_binding",
+  "local_ip": "YOUR_LOCAL_IP_HERE",
+  "home_ip": "YOUR_HOME_IP_HERE",
+  "target_url": "YOUR_TARGET_URL_HERE"
+}
