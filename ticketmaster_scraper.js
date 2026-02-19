@@ -107,63 +107,167 @@ async function run() {
   page.on("response", async (response) => {
     const url = response.url();
     if (
-      url.includes("/api/ismds/event/") ||
-      (url.includes("facets") && url.includes("apikey="))
+      url.includes("/api/") // Catching all API calls for debug
     ) {
       try {
-        const buffer = await response.buffer();
+        // Try to fetch buffer; handle ProtocolError if resource is gone
+        let buffer;
+        try {
+          buffer = await response.buffer();
+        } catch (e) {
+          if (
+            e.message.includes("No data found for resource") ||
+            e.message.includes("Protocol error")
+          ) {
+            // Ignore these common race conditions
+            return;
+          }
+          throw e;
+        }
+
         const json = JSON.parse(buffer.toString());
 
-        // Print resale ticket prices
-        if (json.facets) {
-          console.log(JSON.stringify({ facets: json.facets }));
+        // DEBUG: Log ALL JSON to see where prices are
+        // Filter out huge useless things if needed, but best to capture all for a moment
+        /*
+        if (config.debug_dump || true) {
+          // Force true for this debug step
+          const logEntry = {
+            url: url,
+            data: json,
+          };
+          fs.appendFileSync(
+            "debug_network.json",
+            JSON.stringify(logEntry) + "\n",
+          );
+        }
+        */
 
-          // --- CSV Output Logic ---
-          const outputFilename = "scraped_results.csv";
+        // Parse both Facets (Summary) and Embedded Offers (Detail)
 
-          // 1. Extract Event ID
-          // URL ex: .../event/11006363A5897986
-          const eventIdMatch = config.target_url.match(/event\/([A-Z0-9]+)/i);
-          const eventId = eventIdMatch ? eventIdMatch[1] : "Unknown";
+        const outputFilename = "scraped_results.csv";
+        const timestamp = new Date().toISOString();
 
-          // 2. Extract Event Name (From Page Title or Config)
-          // We'll use the page title which we access below, or try to guess from URL
-          const eventName = (await page.title()).replace(/,|"/g, ""); // Simple sanitize
+        // 1. Extract Event ID & Name
+        const eventIdMatch = config.target_url.match(/event\/([A-Z0-9]+)/i);
+        const eventId = eventIdMatch ? eventIdMatch[1] : "Unknown";
+        let eventName = "Unknown";
+        try {
+          eventName = (await page.title()).replace(/,|"/g, "");
+        } catch (e) {}
 
-          // 3. Extract Resale Stats
-          // Facets structure is complex, let's try to find "resale" inventory type
-          let resaleCount = 0;
-          let minPrice = "N/A";
+        let csvContent = "";
 
-          // Attempt to find resale count in facets (inventoryType)
-          // Structure assumption: facets.inventoryType is an array of objects
-          if (Array.isArray(json.facets.inventoryType)) {
-            const resaleType = json.facets.inventoryType.find(
-              (t) => t.name === "resale" || t.name === "resale ticket",
+        // Helper
+        const writeLine = (
+          section,
+          row,
+          seats,
+          qty,
+          total,
+          list,
+          face,
+          cur,
+          fee,
+          type,
+          notes,
+          offerId,
+          listId,
+        ) => {
+          // Timestamp,EventID,EventName,Section,Row,Seats,Qty,TotalPrice,ListPrice,FaceValue,Currency,TotalFees,Type,SellerNotes,OfferID,ListingID
+          // Escape quotes in notes/desc
+          const safeNotes = (notes || "").replace(/"/g, '""');
+          return `"${timestamp}","${eventId}","${eventName}","${section}","${row}","${seats}","${qty}","${total}","${list}","${face}","${cur}","${fee}","${type}","${safeNotes}","${offerId}","${listId}"\n`;
+        };
+
+        // A. Check for Detailed Offers (The Holy Grail)
+        let detailedFound = false;
+        if (
+          json._embedded &&
+          json._embedded.offer &&
+          Array.isArray(json._embedded.offer)
+        ) {
+          console.log(
+            `[INFO] Found ${json._embedded.offer.length} detailed offers!`,
+          );
+          json._embedded.offer.forEach((offer) => {
+            const section = offer.section || "N/A";
+            const row = offer.row || "N/A";
+            const seatFrom = offer.seatFrom || "";
+            const seatTo = offer.seatTo || "";
+            const seats =
+              seatFrom && seatTo ? `${seatFrom}-${seatTo}` : seatFrom || "N/A";
+
+            // Quantity
+            let qty = 1;
+            if (
+              offer.sellableQuantities &&
+              Array.isArray(offer.sellableQuantities) &&
+              offer.sellableQuantities.length > 0
+            ) {
+              qty = Math.max(...offer.sellableQuantities);
+            } else if (seatFrom && seatTo) {
+              const from = parseInt(seatFrom);
+              const to = parseInt(seatTo);
+              if (!isNaN(from) && !isNaN(to)) qty = to - from + 1;
+            }
+
+            // Pricing Details
+            const total = offer.totalPrice || "N/A";
+            const list = offer.listPrice || "N/A";
+            const face = offer.faceValue || "N/A";
+            const cur = offer.currency || "USD";
+
+            // Calculate Fees
+            let fee = 0;
+            if (offer.charges && Array.isArray(offer.charges)) {
+              fee = offer.charges.reduce((sum, c) => sum + (c.amount || 0), 0);
+            } else if (total !== "N/A" && list !== "N/A") {
+              fee = parseFloat(total) - parseFloat(list); // Approximation
+            }
+            fee = fee.toFixed(2);
+
+            const type = offer.inventoryType || "primary";
+            const notes = offer.sellerNotes || "";
+            const offerId = offer.offerId || "N/A";
+            const listId = offer.listingId || "N/A";
+
+            csvContent += writeLine(
+              section,
+              row,
+              seats,
+              qty,
+              total,
+              list,
+              face,
+              cur,
+              fee,
+              type,
+              notes,
+              offerId,
+              listId,
             );
-            if (resaleType) resaleCount = resaleType.count;
-          }
+          });
+          detailedFound = true;
+        }
 
-          // Attempt to find min price
-          // facets.prices might have min/max
-          if (Array.isArray(json.facets.prices)) {
-            const priceObj = json.facets.prices.find((p) => p.min);
-            if (priceObj) minPrice = priceObj.min;
-          }
+        // B. Fallback to Facets - DISABLED to keep CSV clean
+        // The user found these summary rows ('SummaryGroup', 'See Summary') useless and messy.
+        // We only want rows with actual ticket data.
+        if (!detailedFound && json.facets && Array.isArray(json.facets)) {
+          // console.log(`[INFO] Ignored Facets summary (no detailed offers).`);
+        }
 
-          const timestamp = new Date().toISOString();
-          const csvLine = `"${timestamp}","${eventId}","${eventName}","${config.target_url}","${resaleCount}","${minPrice}"\n`;
-
-          // Check if header needs to be written
+        // Write to file
+        if (csvContent) {
           if (!fs.existsSync(outputFilename)) {
             fs.writeFileSync(
               outputFilename,
-              "Timestamp,EventID,EventName,TargetURL,ResaleCount,MinPrice\n",
+              "Timestamp,EventID,EventName,Section,Row,Seats,Qty,TotalPrice,ListPrice,FaceValue,Currency,TotalFees,Type,SellerNotes,OfferID,ListingID\n",
             );
           }
-
-          fs.appendFileSync(outputFilename, csvLine);
-          console.log(`[SUCCESS] Appended result to ${outputFilename}`);
+          fs.appendFileSync(outputFilename, csvContent);
+          console.log(`[SUCCESS] Appended results to ${outputFilename}`);
         }
       } catch (err) {
         console.error("Error parsing/writing CSV:", err);
